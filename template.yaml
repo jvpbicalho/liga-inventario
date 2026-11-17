@@ -1,0 +1,399 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Inventário da liga acadêmica - web app serverless (Projeto 1 do estudo AWS)
+
+# Nomes gerados pelo CloudFormation (tabelas, funções, buckets do site) não colidem
+# com os recursos criados à mão no console, então as duas versões podem coexistir.
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]
+    CodeUri: src/
+    MemorySize: 128
+    Timeout: 10
+    Environment:
+      Variables:
+        TABELA_ITENS: !Ref ItensTable
+        TABELA_EMPRESTIMOS: !Ref EmprestimosTable
+        # nome montado como texto (e não !Ref) para evitar dependência circular com o gatilho do S3
+        BUCKET_FOTOS: !Sub liga-fotos-${AWS::AccountId}-${AWS::Region}
+
+Resources:
+  # ---------- dados ----------
+
+  ItensTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: itemId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: itemId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+  EmprestimosTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: itemId
+          AttributeType: S
+        - AttributeName: pedidoEm
+          AttributeType: S
+      KeySchema:
+        - AttributeName: itemId
+          KeyType: HASH
+        - AttributeName: pedidoEm
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+  PhotosBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub liga-fotos-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT, GET]
+            AllowedOrigins:
+              - !Sub https://${SiteDistribution.DomainName}
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+
+  # ---------- login ----------
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-usuarios
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub liga-${AWS::AccountId}
+      UserPoolId: !Ref UserPool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: liga-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !Sub https://${SiteDistribution.DomainName}/
+      LogoutURLs:
+        - !Sub https://${SiteDistribution.DomainName}/
+
+  GrupoAdmin:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admin
+      UserPoolId: !Ref UserPool
+
+  GrupoMembro:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: membro
+      UserPoolId: !Ref UserPool
+
+  # ---------- API ----------
+
+  LigaApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Auth:
+        DefaultAuthorizer: CognitoLiga
+        Authorizers:
+          CognitoLiga:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience:
+                - !Ref UserPoolClient
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub https://${SiteDistribution.DomainName}
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, PUT, DELETE]
+        MaxAge: 300
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 5
+
+  # ---------- Lambdas (uma role mínima por função) ----------
+
+  ListItemsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: list_items.lambda_handler
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:Scan
+              Resource: !GetAtt ItensTable.Arn
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::liga-fotos-${AWS::AccountId}-${AWS::Region}/miniaturas/*
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LigaApi
+            Path: /itens
+            Method: GET
+
+  CreateItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: create_item.lambda_handler
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt ItensTable.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LigaApi
+            Path: /itens
+            Method: POST
+
+  UpdateItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: update_item.lambda_handler
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt ItensTable.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LigaApi
+            Path: /itens/{itemId}
+            Method: PUT
+
+  DeleteItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: delete_item.lambda_handler
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:DeleteItem
+              Resource: !GetAtt ItensTable.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LigaApi
+            Path: /itens/{itemId}
+            Method: DELETE
+
+  PhotoUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: photo_upload_url.lambda_handler
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::liga-fotos-${AWS::AccountId}-${AWS::Region}/originais/*
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt ItensTable.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LigaApi
+            Path: /itens/{itemId}/foto
+            Method: POST
+
+  RequestLoanFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: request_loan.lambda_handler
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt ItensTable.Arn
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt EmprestimosTable.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LigaApi
+            Path: /itens/{itemId}/emprestimo
+            Method: POST
+
+  ReturnItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: return_item.lambda_handler
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt ItensTable.Arn
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt EmprestimosTable.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LigaApi
+            Path: /itens/{itemId}/devolucao
+            Method: POST
+
+  # ---------- miniaturas ----------
+
+  PillowLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: layers/pillow/
+      CompatibleRuntimes: [python3.13]
+      CompatibleArchitectures: [arm64]
+    Metadata:
+      BuildMethod: makefile
+      BuildArchitecture: arm64
+
+  MakeThumbnailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: make_thumbnail.lambda_handler
+      MemorySize: 512
+      Timeout: 30
+      Layers:
+        - !Ref PillowLayer
+      Policies:
+        # só lê de originais/ e só grava em miniaturas/: segunda trava contra o loop infinito
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::liga-fotos-${AWS::AccountId}-${AWS::Region}/originais/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::liga-fotos-${AWS::AccountId}-${AWS::Region}/miniaturas/*
+      Events:
+        FotoNova:
+          Type: S3
+          Properties:
+            Bucket: !Ref PhotosBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: originais/
+                  - Name: suffix
+                    Value: .jpg
+
+  # ---------- site ----------
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-site
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # política gerenciada CachingOptimized
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}
+
+Outputs:
+  SiteUrl:
+    Value: !Sub https://${SiteDistribution.DomainName}
+  ApiUrl:
+    Value: !Sub https://${LigaApi}.execute-api.${AWS::Region}.amazonaws.com
+  CognitoDomain:
+    Value: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  PhotosBucketName:
+    Value: !Ref PhotosBucket
+  DistributionId:
+    Value: !Ref SiteDistribution
